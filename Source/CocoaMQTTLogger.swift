@@ -25,42 +25,47 @@ func printError(_ message: String) {
     CocoaMQTTLogger.logger.error(message)
 }
 
-
 // Enum log levels
 public enum CocoaMQTTLoggerLevel: Int {
     case debug = 0, info, warning, error, off
 }
 
-
 open class CocoaMQTTLogger: NSObject {
-    
+
     // Singleton
+    // Keep mutable global logger for backward compatibility.
+    // Accesses are intentionally marked as unsafe-isolated for Swift 6 readiness.
+    #if swift(>=6)
+    public nonisolated(unsafe) static var logger = CocoaMQTTLogger()
+    #else
     public static var logger = CocoaMQTTLogger()
+    #endif
     public override init() { super.init() }
 
     // min level
-    var minLevel: CocoaMQTTLoggerLevel = .warning
-    
+    @ConcurrentAtomic(wrappedValue: .warning, label: "CocoaMQTTLogger.minLevel")
+    public var minLevel: CocoaMQTTLoggerLevel
+
     // logs
     open func log(level: CocoaMQTTLoggerLevel, message: String) {
         guard level.rawValue >= minLevel.rawValue else { return }
         print("CocoaMQTT(\(level)): \(message)")
     }
-    
+
     func debug(_ message: String) {
         log(level: .debug, message: message)
     }
-    
+
     func info(_ message: String) {
         log(level: .info, message: message)
     }
-    
+
     func warning(_ message: String) {
         log(level: .warning, message: message)
     }
-    
+
     func error(_ message: String) {
         log(level: .error, message: message)
     }
-    
+
 }

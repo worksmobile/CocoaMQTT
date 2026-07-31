@@ -11,35 +11,48 @@ import Foundation
 // MQTT PUBLISH Frame
 struct FramePublish: Frame {
 
-    //3.3.1.4 Remaining Length
+    // 3.3.1.4 Remaining Length
     public var remainingLength: UInt32?
 
-    //3.3.2.1 Topic Name
+    // 3.3.2.1 Topic Name
     public var topicName: String?
-    //3.3.2.2 Packet Identifier
+    // 3.3.2.2 Packet Identifier
     public var packetIdentifier: UInt16?
 
-    //3.3.2.3 PUBLISH Properties
+    // 3.3.2.3 PUBLISH Properties
     public var publishProperties: MqttPublishProperties?
+    /// Encoded at the publish boundary so queued and retried frames do not retain
+    /// a caller-owned, mutable properties object.
+    private var publishPropertiesSnapshot: [UInt8]?
     public var publishRecProperties: MqttDecodePublish?
 
     var packetFixedHeaderType: UInt8 = FrameType.publish.rawValue
-    
+
     // --- Attributes
-    
+
     var msgid: UInt16
-    
-    var topic: String = "";
-    
+
+    var topic: String = ""
+
     var _payload: [UInt8] = []
 
-    var mqtt5Topic: String = "";
+    var mqtt5Topic: String = ""
 
+    /// Local-only identifier used to associate a queued publish with its original message.
+    /// QoS 0 packets have no MQTT Packet Identifier, so this value must not be encoded.
+    var deliveryToken: UInt64?
+
+    /// Full topic used only when persisting an alias-only MQTT 5 PUBLISH. Topic Alias
+    /// mappings do not survive a network reconnect, so stored packets must be standalone.
+    var persistenceTopic: String?
+
+    /// Local-only marker for a packet restored from persistent session state.
+    var isSessionRecovery = false
 
     // --- Attributes End
-    
-    init(topic: String, payload: [UInt8], qos: CocoaMQTTQoS = .qos0, msgid: UInt16 = 0){
-        
+
+    init(topic: String, payload: [UInt8], qos: CocoaMQTTQoS = .qos0, msgid: UInt16 = 0) {
+
         self.topic = topic
         self._payload = payload
         self.msgid = msgid
@@ -48,43 +61,45 @@ struct FramePublish: Frame {
 }
 
 extension FramePublish {
-    
+
     func fixedHeader() -> [UInt8] {
-        
+
         var header = [UInt8]()
         header += [FrameType.publish.rawValue]
 
         return header
     }
-    
+
     func variableHeader5() -> [UInt8] {
 
-        //3.3.2.1 Topic Name
+        // 3.3.2.1 Topic Name
         var header = self.topic.bytesWithLength
-        //3.3.2.2 Packet Identifier qos1 or qos2
+        // 3.3.2.2 Packet Identifier qos1 or qos2
         if qos > .qos0 {
             header += msgid.hlBytes
             //            header.append(UInt8(0))
             //            header.append(QoS.rawValue)
         }
 
-        //MQTT 5.0
+        // MQTT 5.0
         header += beVariableByteInteger(length: self.properties().count)
-
 
         return header
     }
-    
+
     func payload5() -> [UInt8] { return _payload }
 
     func properties() -> [UInt8] {
-        
-        // Properties
-        return publishProperties?.properties ?? []
+        return publishPropertiesSnapshot ?? publishProperties?.properties ?? []
+    }
+
+    mutating func snapshotPublishProperties(_ properties: MqttPublishProperties) {
+        publishPropertiesSnapshot = properties.properties
+        publishProperties = nil
     }
 
     func allData() -> [UInt8] {
-        
+
         var allData = [UInt8]()
 
         allData += fixedHeader()
@@ -110,105 +125,73 @@ extension FramePublish {
 }
 
 extension FramePublish: InitialWithBytes {
-    
+
     init?(packetFixedHeaderType: UInt8, bytes: [UInt8]) {
-        
+        self.init(packetFixedHeaderType: packetFixedHeaderType, bytes: bytes, protocolVersion: .v311)
+    }
+
+    init?(packetFixedHeaderType: UInt8, bytes: [UInt8], protocolVersion: CocoaMQTTProtocolVersion) {
+
         guard packetFixedHeaderType & 0xF0 == FrameType.publish.rawValue else {
             return nil
         }
-        let recDup = ((packetFixedHeaderType & 0b0000_1000) >> 3) > 0
-
         guard let recQos = CocoaMQTTQoS(rawValue: (packetFixedHeaderType & 0b0000_0110) >> 1) else {
             return nil
         }
+        guard recQos != .FAILURE else { return nil }
+        guard recQos != .qos0 || packetFixedHeaderType & 0x08 == 0 else { return nil }
+        self.packetFixedHeaderType = packetFixedHeaderType
 
-        let recRetain = (packetFixedHeaderType & 0b0000_0001) > 0
-        // Reserved
-        var flags: UInt8 = 0
+        // Packet Identifier
+        // The Packet Identifier field is only present in PUBLISH packets where the QoS level is 1 or 2.
 
-        if recRetain {
-            flags = flags | 0b0000_0001
-        } else {
-            flags = flags | 0b0000_0000
-        }
-
-        if recDup {
-            flags = flags | 0b0011_1000
-        } else {
-            flags = flags | 0b0011_0000
-        }
-
-        switch recQos {
-        case .qos0:
-            flags = flags | 0b0011_0000
-        case .qos1:
-            flags = flags | 0b0011_0010
-        case .qos2:
-            flags = flags | 0b0011_0100
-        case .FAILURE:
-            printDebug("FAILTURE")
-        }
-        self.packetFixedHeaderType = flags
-
-        /// Packet Identifier
-        /// The Packet Identifier field is only present in PUBLISH packets where the QoS level is 1 or 2.
-
-        // parse topic
-        if bytes.count < 2 {
-            return nil
-        }
-
-        let len = UInt16(bytes[0]) << 8 + UInt16(bytes[1])
-
-        //2 is packetFixedHeaderType length
-        var pos = 2 + Int(len)
-
-        if bytes.count < pos {
-            return nil
-        }
-
-        // msgid
-        if (packetFixedHeaderType & 0x06) >> 1 == CocoaMQTTQoS.qos0.rawValue {
-            msgid = 0
-        } else {
-            if bytes.count < pos + 2 {
-                return nil
-            }
-            msgid = UInt16(bytes[pos]) << 8 + UInt16(bytes[pos+1])
-            pos += 2
-        }
-
-
-        var protocolVersion = "";
-        if let storage = CocoaMQTTStorage() {
-            protocolVersion = storage.queryMQTTVersion()
-        }
-
-        if (protocolVersion == "5.0"){
+        let pos: Int
+        if protocolVersion == .v5 {
             let data = MqttDecodePublish()
-            data.decodePublish(fixedHeader: packetFixedHeaderType ,publishData: bytes)
-            pos = data.mqtt5DataIndex
+            guard data.decodePublish(fixedHeader: packetFixedHeaderType,
+                                     publishData: bytes,
+                                     protocolVersion: protocolVersion) else { return nil }
+            pos = data.mqtt5DataIndex + (data.propertyLength ?? 0)
 
-            if(data.propertyLength != 0){
-                pos += data.propertyLength!
+            // MQTT 5.0: Topic Name may be empty only when Topic Alias is present.
+            if data.topic.isEmpty && data.topicAlias == nil {
+                return nil
             }
 
             // MQTT 5.0
             self.mqtt5Topic = data.topic
+            self.topic = data.topic
             self.packetIdentifier = data.packetIdentifier
+            self.msgid = data.packetIdentifier ?? 0
             self.publishRecProperties = data
 
-        }else{
+        } else {
             // MQTT 3.1.1
-            topic = NSString(bytes: [UInt8](bytes[2...(pos-1)]), length: Int(len), encoding: String.Encoding.utf8.rawValue)! as String
+            guard var reader = MQTTByteReader(bytes),
+                  let recTopic = reader.readUTF8String(), !recTopic.isEmpty,
+                  !recTopic.contains("+"), !recTopic.contains("#") else { return nil }
+            topic = recTopic
+            if recQos == .qos0 {
+                msgid = 0
+            } else {
+                guard let identifier = reader.readUInt16(), identifier != 0 else { return nil }
+                msgid = identifier
+            }
+            pos = reader.index
         }
 
         // payload
-        if (pos == bytes.count) {
+        if pos == bytes.count {
             _payload = []
-        } else if (pos < bytes.count) {
+        } else if pos < bytes.count {
             _payload = [UInt8](bytes[pos..<bytes.count])
         } else {
+            return nil
+        }
+
+        if protocolVersion == .v5,
+           publishRecProperties?.payloadFormatIndicator == .utf8,
+           String(bytes: _payload, encoding: .utf8) == nil {
             return nil
         }
 

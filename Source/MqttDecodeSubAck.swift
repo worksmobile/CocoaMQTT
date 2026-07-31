@@ -14,89 +14,39 @@ public class MqttDecodeSubAck: NSObject {
     var propertyLength: Int = 0
 
     public var reasonCodes: [CocoaMQTTSUBACKReasonCode] = []
-    //public var reasonCode: CocoaMQTTSUBACKReasonCode?
+    // public var reasonCode: CocoaMQTTSUBACKReasonCode?
     public var msgid: UInt16 = 0
     public var reasonString: String?
     public var userProperty: [String: String]?
+    public var userProperties = [CocoaMQTTUserProperty]()
 
+    @available(*, deprecated, message: "Assumes MQTT 5 data; use the overload with protocolVersion")
+    public func decodeSubAck(fixedHeader: UInt8, pubAckData: [UInt8]) {
+        _ = decodeSubAck(fixedHeader: fixedHeader, pubAckData: pubAckData, protocolVersion: .v5)
+    }
 
-    public func decodeSubAck(fixedHeader: UInt8, pubAckData: [UInt8]){
+    @discardableResult
+    public func decodeSubAck(fixedHeader: UInt8,
+                             pubAckData: [UInt8],
+                             protocolVersion: CocoaMQTTProtocolVersion) -> Bool {
+        guard fixedHeader == FrameType.suback.rawValue,
+              let decoded = decodeReasonCodeList(pubAckData, protocolVersion: protocolVersion),
+              !decoded.reasonCodes.isEmpty else { return false }
+        if protocolVersion == .v311 {
+            let validCodes: Set<UInt8> = [0x00, 0x01, 0x02, 0x80]
+            guard decoded.reasonCodes.allSatisfy(validCodes.contains) else { return false }
+        }
+        let codes = decoded.reasonCodes.compactMap(CocoaMQTTSUBACKReasonCode.init(rawValue:))
+        guard codes.count == decoded.reasonCodes.count else { return false }
         totalCount = pubAckData.count
-        dataIndex = 0
-        //msgid
-        let msgidResult = integerCompute(data: pubAckData, formatType: formatInt.formatUint16.rawValue, offset: dataIndex)
-        msgid = UInt16(msgidResult!.res)
-        dataIndex = msgidResult!.newOffset
-
-        var protocolVersion = "";
-        if let storage = CocoaMQTTStorage() {
-            protocolVersion = storage.queryMQTTVersion()
-        }
-
-        if (protocolVersion == "5.0"){
-            // 3.9.2.1  SUBACK Properties
-            // 3.9.2.1.1  Property Length
-            let propertyLengthVariableByteInteger = decodeVariableByteInteger(data: pubAckData, offset: dataIndex)
-            propertyLength = propertyLengthVariableByteInteger.res
-            dataIndex = propertyLengthVariableByteInteger.newOffset
-            let occupyIndex = dataIndex
-
-            while dataIndex < occupyIndex + propertyLength {
-                let resVariableByteInteger = decodeVariableByteInteger(data: pubAckData, offset: dataIndex)
-                dataIndex = resVariableByteInteger.newOffset
-                let propertyNameByte = resVariableByteInteger.res
-                guard let propertyName = CocoaMQTTPropertyName(rawValue: UInt8(propertyNameByte)) else {
-                    break
-                }
-
-
-                switch propertyName.rawValue {
-                // 3.9.2.1.2 Reason String
-                case CocoaMQTTPropertyName.reasonString.rawValue:
-                    guard let result = unsignedByteToString(data: pubAckData, offset: dataIndex) else {
-                        break
-                    }
-                    reasonString = result.resStr
-                    dataIndex = result.newOffset
-
-                // 3.9.2.1.3 User Property
-                case CocoaMQTTPropertyName.userProperty.rawValue:
-                    var key:String?
-                    var value:String?
-                    guard let keyRes = unsignedByteToString(data: pubAckData, offset: dataIndex) else {
-                        break
-                    }
-                    key = keyRes.resStr
-                    dataIndex = keyRes.newOffset
-
-                    guard let valRes = unsignedByteToString(data: pubAckData, offset: dataIndex) else {
-                        break
-                    }
-                    value = valRes.resStr
-                    dataIndex = valRes.newOffset
-
-                    userProperty![key!] = value
-
-
-                default:
-                    return
-                }
-            }
-        }
-
-
-        if dataIndex < totalCount {
-            while dataIndex < totalCount {
-                guard let reasonCode = CocoaMQTTSUBACKReasonCode(rawValue: pubAckData[dataIndex]) else {
-                    return
-                }
-                reasonCodes.append(reasonCode)
-                dataIndex += 1
-            }
-        }
-        
+        dataIndex = pubAckData.count
+        propertyLength = decoded.propertyLength
+        msgid = decoded.msgid
+        reasonString = decoded.reasonString
+        userProperty = decoded.userProperty
+        userProperties = decoded.userProperties
+        reasonCodes = codes
+        return true
     }
 
 }
-
-

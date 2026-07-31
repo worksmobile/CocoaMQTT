@@ -35,26 +35,46 @@ protocol CocoaMQTTReaderDelegate: AnyObject {
     func didReceive(_ reader: CocoaMQTTReader, unsuback: FrameUnsubAck)
 
     func didReceive(_ reader: CocoaMQTTReader, pingresp: FramePingResp)
+
+    func didReceive(_ reader: CocoaMQTTReader, disconnect: FrameDisconnect)
+
+    func didReceive(_ reader: CocoaMQTTReader, auth: FrameAuth)
 }
 
 class CocoaMQTTReader {
+
+    static let defaultPacketReadTimeout: TimeInterval = 30
 
     private var socket: CocoaMQTTSocketProtocol
 
     private weak var delegate: CocoaMQTTReaderDelegate?
 
-    private let timeout: TimeInterval = 30_000
+    private let protocolVersion: CocoaMQTTProtocolVersion
+
+    private let maximumPacketSize: UInt32?
+
+    private let packetReadTimeout: TimeInterval
 
     /*  -- Reader states -- */
     private var header: UInt8 = 0
     private var length: UInt = 0
     private var data: [UInt8] = []
     private var multiply = 1
+    private var lengthByteCount = 0
     /*  -- Reader states -- */
 
-    init(socket: CocoaMQTTSocketProtocol, delegate: CocoaMQTTReaderDelegate?) {
+    init(socket: CocoaMQTTSocketProtocol,
+         delegate: CocoaMQTTReaderDelegate?,
+         protocolVersion: CocoaMQTTProtocolVersion = .v311,
+         maximumPacketSize: UInt32? = nil,
+         packetReadTimeout: TimeInterval = CocoaMQTTReader.defaultPacketReadTimeout) {
         self.socket = socket
         self.delegate = delegate
+        self.protocolVersion = protocolVersion
+        self.maximumPacketSize = maximumPacketSize
+        self.packetReadTimeout = packetReadTimeout.isFinite && packetReadTimeout > 0
+            ? packetReadTimeout
+            : -1
     }
 
     func start() {
@@ -67,9 +87,25 @@ class CocoaMQTTReader {
     }
 
     func lengthReady(_ byte: UInt8) {
+        lengthByteCount += 1
+        guard lengthByteCount <= 4 else {
+            protocolError("Remaining Length exceeds four bytes")
+            return
+        }
         length += (UInt)((Int)(byte & 127) * multiply)
         // done
         if byte & 0x80 == 0 {
+            guard lengthByteCount == 1 || byte & 0x7f != 0 else {
+                protocolError("Remaining Length is not minimally encoded")
+                return
+            }
+            if let maximumPacketSize = maximumPacketSize {
+                let packetSize = UInt64(1 + lengthByteCount) + UInt64(length)
+                guard packetSize <= UInt64(maximumPacketSize) else {
+                    protocolError("Packet exceeds the client Maximum Packet Size")
+                    return
+                }
+            }
             if length == 0 {
                 frameReady()
             } else {
@@ -77,10 +113,14 @@ class CocoaMQTTReader {
             }
             // more
         } else {
+            guard lengthByteCount < 4 else {
+                protocolError("Remaining Length exceeds four bytes")
+                return
+            }
             let result = multiply.multipliedReportingOverflow(by: 128)
             if !result.overflow {
                 multiply = result.partialValue
-            }else{
+            } else {
                 reset()
             }
             readLength()
@@ -99,18 +139,17 @@ class CocoaMQTTReader {
     }
 
     private func readLength() {
-        socket.readData(toLength: 1, withTimeout: timeout, tag: CocoaMQTTReadTag.length.rawValue)
+        socket.readData(toLength: 1, withTimeout: packetReadTimeout, tag: CocoaMQTTReadTag.length.rawValue)
     }
 
     private func readPayload() {
-        socket.readData(toLength: length, withTimeout: timeout, tag: CocoaMQTTReadTag.payload.rawValue)
+        socket.readData(toLength: length, withTimeout: packetReadTimeout, tag: CocoaMQTTReadTag.payload.rawValue)
     }
 
     private func frameReady() {
 
         guard let frameType = FrameType(rawValue: UInt8(header & 0xF0)) else {
-            printError("Received unknown frame type, header: \(header), data:\(data)")
-            readHeader()
+            protocolError("Received unknown frame type, header: \(header), data:\(data)")
             return
         }
 
@@ -118,69 +157,96 @@ class CocoaMQTTReader {
 
         switch frameType {
         case .connack:
-            guard let connack = FrameConnAck(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let connack = FrameConnAck(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, connack: connack)
         case .publish:
-            guard let publish = FramePublish(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let publish = FramePublish(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, publish: publish)
         case .puback:
-            guard let puback = FramePubAck(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let puback = FramePubAck(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, puback: puback)
         case .pubrec:
-            guard let pubrec = FramePubRec(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let pubrec = FramePubRec(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, pubrec: pubrec)
         case .pubrel:
-            guard let pubrel = FramePubRel(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let pubrel = FramePubRel(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, pubrel: pubrel)
         case .pubcomp:
-            guard let pubcomp = FramePubComp(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let pubcomp = FramePubComp(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, pubcomp: pubcomp)
         case .suback:
-            guard let frame = FrameSubAck(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let frame = FrameSubAck(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, suback: frame)
         case .unsuback:
-            guard let frame = FrameUnsubAck(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+            guard let frame = FrameUnsubAck(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, unsuback: frame)
         case .pingresp:
             guard let frame = FramePingResp(packetFixedHeaderType: header, bytes: data) else {
-                printError("Reader parse \(frameType) failed, data: \(data)")
-                break
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
             }
             delegate?.didReceive(self, pingresp: frame)
+        case .disconnect:
+            guard protocolVersion == .v5 else {
+                protocolError("Reader received MQTT5-only frame \(frameType) in non-MQTT5 mode, data: \(data)")
+                return
+            }
+            guard let frame = FrameDisconnect(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
+            }
+            delegate?.didReceive(self, disconnect: frame)
+        case .auth:
+            guard protocolVersion == .v5 else {
+                protocolError("Reader received MQTT5-only frame \(frameType) in non-MQTT5 mode, data: \(data)")
+                return
+            }
+            guard let frame = FrameAuth(packetFixedHeaderType: header, bytes: data, protocolVersion: protocolVersion) else {
+                protocolError("Reader parse \(frameType) failed, data: \(data)")
+                return
+            }
+            delegate?.didReceive(self, auth: frame)
         default:
-            break
+            protocolError("Received unsupported frame type \(frameType), data: \(data)")
+            return
         }
 
         readHeader()
     }
 
+    private func protocolError(_ reason: String) {
+        printError(reason)
+        socket.disconnect()
+    }
+
     private func reset() {
         length = 0
         multiply = 1
+        lengthByteCount = 0
         header = 0
         data = []
     }
